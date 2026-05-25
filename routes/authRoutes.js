@@ -1,9 +1,53 @@
 const express = require('express')
 const nodemailer = require('nodemailer')
+const sgMail = require('@sendgrid/mail')
 const AdminCredential = require('../models/AdminCredential')
 const PasswordResetToken = require('../models/PasswordResetToken')
 
 const router = express.Router()
+
+const getEnv = (key) => String(process.env[key] || '').trim()
+
+const sendEmail = async ({ to, subject, text }) => {
+  const sendgridKey = getEnv('SENDGRID_API_KEY')
+  const sendgridFrom = getEnv('SENDGRID_FROM')
+  if (sendgridKey) {
+    if (!sendgridFrom) {
+      const error = new Error('SendGrid is configured but SENDGRID_FROM is missing')
+      error.code = 'ECONFIG'
+      throw error
+    }
+    sgMail.setApiKey(sendgridKey)
+    await sgMail.send({ to, from: sendgridFrom, subject, text })
+    return
+  }
+
+  const smtpHost = getEnv('SMTP_HOST')
+  const smtpUser = getEnv('SMTP_USER')
+  const smtpPass = getEnv('SMTP_PASS')
+  const smtpFrom = getEnv('SMTP_FROM') || smtpUser
+
+  if (!smtpHost || !smtpUser || !smtpPass || !smtpFrom) {
+    const error = new Error('Email service is not configured')
+    error.code = 'ECONFIG'
+    throw error
+  }
+
+  const port = Number(getEnv('SMTP_PORT') || '587') || 587
+  const secure = getEnv('SMTP_SECURE').toLowerCase() === 'true'
+
+  const transporter = nodemailer.createTransport({
+    host: smtpHost,
+    port,
+    secure,
+    auth: { user: smtpUser, pass: smtpPass },
+    connectionTimeout: 20000,
+    greetingTimeout: 20000,
+    socketTimeout: 20000,
+  })
+
+  await transporter.sendMail({ from: smtpFrom, to, subject, text })
+}
 
 router.post('/login', (req, res) => {
   const { username, password } = req.body || {}
@@ -28,25 +72,6 @@ router.post('/forgot-password', (req, res) => {
     return res.json({ ok: true, message: 'If the account exists, a reset email has been sent.' })
   }
 
-  const smtpHost = String(process.env.SMTP_HOST || '').trim()
-  const smtpUser = String(process.env.SMTP_USER || '').trim()
-  const smtpPass = String(process.env.SMTP_PASS || '').trim()
-  const smtpFrom = String(process.env.SMTP_FROM || smtpUser || '').trim()
-
-  if (!smtpHost || !smtpUser || !smtpPass || !smtpFrom) {
-    return res.status(500).json({ message: 'Email service is not configured' })
-  }
-
-  const port = Number(String(process.env.SMTP_PORT || '587').trim()) || 587
-  const secure = String(process.env.SMTP_SECURE || '').trim().toLowerCase() === 'true'
-
-  const transporter = nodemailer.createTransport({
-    host: smtpHost,
-    port,
-    secure,
-    auth: { user: smtpUser, pass: smtpPass },
-  })
-
   const appUrl = process.env.APP_URL || 'http://localhost:3000'
 
   const run = async () => {
@@ -56,8 +81,6 @@ router.post('/forgot-password', (req, res) => {
     if (!existing) {
       return res.json({ ok: true, message: 'If the account exists, a reset email has been sent.' })
     }
-
-    await transporter.verify()
 
     const { token, expiresAt } = await PasswordResetToken.createToken(adminUsername, 15)
     const resetLink = `${appUrl}/reset-password?token=${token}&username=${encodeURIComponent(adminUsername)}`
@@ -76,7 +99,7 @@ router.post('/forgot-password', (req, res) => {
     ].join('\n')
 
     try {
-      await transporter.sendMail({ from: smtpFrom, to: adminUsername, subject, text })
+      await sendEmail({ to: adminUsername, subject, text })
       return res.json({ ok: true, message: 'Reset link sent to your email.' })
     } catch (error) {
       await PasswordResetToken.deleteMany({ username: adminUsername })
@@ -91,7 +114,7 @@ router.post('/forgot-password', (req, res) => {
     })
     res.status(500).json({
       message: 'Unable to send reset email',
-      detail: error?.code || error?.message || 'UNKNOWN',
+      detail: error?.code || error?.response?.body?.errors?.[0]?.message || error?.message || 'UNKNOWN',
     })
   })
 })
